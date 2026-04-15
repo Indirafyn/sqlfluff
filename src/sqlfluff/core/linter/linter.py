@@ -658,8 +658,8 @@ class Linter:
         loop_check_tuple = (new_tree.raw, tuple(new_tree.source_fixes))
         if loop_check_tuple == (tree.raw, tuple(tree.source_fixes)):
             linter_logger.debug(
-                f"Fixes for {crawler.code} could not be safely be "
-                "applied. Likely due to initially unparsable file."
+                f"Fixes for {crawler.code} could not safely be applied. "
+                "Likely due to initially unparsable file."
             )
             return tree, last_fixes, False
 
