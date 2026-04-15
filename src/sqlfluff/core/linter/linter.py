@@ -537,86 +537,22 @@ class Linter:
                         initial_linting_errors += linting_errors
 
                     if fix and fixes:
-                        linter_logger.info(f"Applying Fixes [{crawler.code}]: {fixes}")
-                        # Do some sanity checks on the fixes before applying.
-                        anchor_info = compute_anchor_edit_info(fixes)
-                        if any(
-                            not info.is_valid for info in anchor_info.values()
-                        ):  # pragma: no cover
-                            message = (
-                                f"Rule {crawler.code} returned conflicting "
-                                "fixes with the same anchor. This is only "
-                                "supported for create_before+create_after, so "
-                                "the fixes will not be applied. "
+                        # Refactoring type: Extract Method. Delegate fix application
+                        # to keep lint_fix_parsed() focused on loop orchestration.
+                        tree, last_fixes, changed_rule = (
+                            cls._apply_rule_fixes_with_guard_clauses(
+                                tree=tree,
+                                config=config,
+                                crawler=crawler,
+                                fixes=fixes,
+                                linting_errors=linting_errors,
+                                last_fixes=last_fixes,
+                                previous_versions=previous_versions,
                             )
-                            for uuid, info in anchor_info.items():
-                                if not info.is_valid:
-                                    message += f"\n{uuid}:"
-                                    for _fix in info.fixes:
-                                        message += f"\n    {_fix}"
-                            cls._report_conflicting_fixes_same_anchor(message)
-                            for lint_result in linting_errors:
-                                lint_result.fixes = []
-                        elif fixes == last_fixes:
-                            # If we generate the same fixes two times in a row,
-                            # that means we're in a loop, and we want to stop.
-                            # (Fixes should address issues, hence different
-                            # and/or fewer fixes next time.)
-                            # This is most likely because fixes could not be safely
-                            # applied last time, so we should stop gracefully.
-                            linter_logger.debug(
-                                f"Fixes generated for {crawler.code} are the same as "
-                                "the previous pass. Assuming that we cannot apply them "
-                                "safely. Passing gracefully."
-                            )
-                        else:
-                            # This is the happy path. We have fixes, now we want to
-                            # apply them.
-                            last_fixes = fixes
-                            new_tree, _, _, _valid = apply_fixes(
-                                tree,
-                                config.get("dialect_obj"),
-                                crawler.code,
-                                anchor_info,
-                                fix_even_unparsable=config.get("fix_even_unparsable"),
-                                max_parse_depth=config.get("max_parse_depth"),
-                            )
-
-                            # Check for infinite loops. We use a combination of the
-                            # fixed templated file and the list of source fixes to
-                            # apply.
-                            loop_check_tuple = (
-                                new_tree.raw,
-                                tuple(new_tree.source_fixes),
-                            )
-                            # Was anything actually applied? If not, then the fixes we
-                            # had cannot be safely applied and we should stop trying.
-                            if loop_check_tuple == (tree.raw, tuple(tree.source_fixes)):
-                                linter_logger.debug(
-                                    f"Fixes for {crawler.code} could not be safely be "
-                                    "applied. Likely due to initially unparsable file."
-                                )
-                            elif not _valid:
-                                # The fixes result in an invalid file. Don't apply
-                                # the fix and skip onward. Show a warning.
-                                linter_logger.warning(
-                                    f"Fixes for {crawler.code} not applied, as it "
-                                    "would result in an unparsable file. Please "
-                                    "report this as a bug with a minimal query "
-                                    "which demonstrates this warning."
-                                )
-                            elif loop_check_tuple not in previous_versions:
-                                # We've not seen this version of the file so
-                                # far. Continue.
-                                tree = new_tree
-                                previous_versions.add(loop_check_tuple)
-                                changed = True
-                                continue
-                            else:
-                                # Applying these fixes took us back to a state
-                                # which we've seen before. We're in a loop, so
-                                # we want to stop.
-                                cls._warn_unfixable(crawler.code)
+                        )
+                        if changed_rule:
+                            changed = True
+                            continue
 
                     # Record rule timing
                     rule_timings.append(
@@ -669,6 +605,103 @@ class Linter:
         return tree, initial_linting_errors, ignore_mask, rule_timings
 
     @classmethod
+    def _apply_rule_fixes_with_guard_clauses(
+        cls,
+        tree: BaseSegment,
+        config: FluffConfig,
+        crawler: BaseRule,
+        fixes: list[LintFix],
+        linting_errors: list[SQLBaseError],
+        last_fixes: Optional[list[LintFix]],
+        previous_versions: set[tuple[str, tuple["SourceFix", ...]]],
+    ) -> tuple[BaseSegment, Optional[list[LintFix]], bool]:
+        """Apply crawler fixes and report whether they changed the tree."""
+        # Refactoring type: Replace Nested Conditional with Guard Clauses.
+        # The fix decision flow now exits early for each terminal condition.
+        linter_logger.info(f"Applying Fixes [{crawler.code}]: {fixes}")
+        anchor_info = compute_anchor_edit_info(fixes)
+        if any(not info.is_valid for info in anchor_info.values()):  # pragma: no cover
+            message = (
+                f"Rule {crawler.code} returned conflicting "
+                "fixes with the same anchor. This is only "
+                "supported for create_before+create_after, so "
+                "the fixes will not be applied. "
+            )
+            for uuid, info in anchor_info.items():
+                if not info.is_valid:
+                    message += f"\n{uuid}:"
+                    for _fix in info.fixes:
+                        message += f"\n    {_fix}"
+            cls._report_conflicting_fixes_same_anchor(message)
+            for lint_result in linting_errors:
+                lint_result.fixes = []
+            return tree, last_fixes, False
+
+        if fixes == last_fixes:
+            linter_logger.debug(
+                f"Fixes generated for {crawler.code} are the same as "
+                "the previous pass. Assuming that we cannot apply them "
+                "safely. Passing gracefully."
+            )
+            return tree, last_fixes, False
+
+        last_fixes = fixes
+        new_tree, _, _, _valid = apply_fixes(
+            tree,
+            config.get("dialect_obj"),
+            crawler.code,
+            anchor_info,
+            fix_even_unparsable=config.get("fix_even_unparsable"),
+            max_parse_depth=config.get("max_parse_depth"),
+        )
+
+        loop_check_tuple = (new_tree.raw, tuple(new_tree.source_fixes))
+        if loop_check_tuple == (tree.raw, tuple(tree.source_fixes)):
+            linter_logger.debug(
+                f"Fixes for {crawler.code} could not safely be applied. "
+                "Likely due to initially unparsable file."
+            )
+            return tree, last_fixes, False
+
+        if not _valid:
+            linter_logger.warning(
+                f"Fixes for {crawler.code} not applied, as it "
+                "would result in an unparsable file. Please "
+                "report this as a bug with a minimal query "
+                "which demonstrates this warning."
+            )
+            return tree, last_fixes, False
+
+        if loop_check_tuple in previous_versions:
+            cls._warn_unfixable(crawler.code)
+            return tree, last_fixes, False
+
+        previous_versions.add(loop_check_tuple)
+        return new_tree, last_fixes, True
+
+    @classmethod
+    def _lint_variant(
+        cls,
+        variant: ParsedVariant,
+        parsed: ParsedString,
+        rule_pack: RulePack,
+        fix: bool,
+        formatter: Optional[FormatterInterface],
+    ) -> tuple[BaseSegment, list[SQLBaseError], Optional[IgnoreMask], RuleTimingsType]:
+        """Lint one parsed variant and return lint-fix output tuple."""
+        # Refactoring type: Extract Method. Shared root/alternate variant lint logic.
+        assert variant.tree
+        return cls.lint_fix_parsed(
+            variant.tree,
+            config=parsed.config,
+            rule_pack=rule_pack,
+            fix=fix,
+            fname=parsed.fname,
+            templated_file=variant.templated_file,
+            formatter=formatter,
+        )
+
+    @classmethod
     def lint_parsed(
         cls,
         parsed: ParsedString,
@@ -687,9 +720,11 @@ class Linter:
         # First identify the root variant. That's the first variant
         # that successfully parsed.
         root_variant: Optional[ParsedVariant] = None
-        for variant in parsed.parsed_variants:
-            if variant.tree:
-                root_variant = variant
+        # Refactoring type: Rename Variable. Use explicit names to avoid
+        # reusing `variant` across root and alternate variant handling.
+        for parsed_variant in parsed.parsed_variants:
+            if parsed_variant.tree:
+                root_variant = parsed_variant
                 break
         else:
             linter_logger.info(
@@ -705,19 +740,17 @@ class Linter:
                 initial_linting_errors,
                 ignore_mask,
                 rule_timings,
-            ) = cls.lint_fix_parsed(
-                root_variant.tree,
-                config=parsed.config,
+            ) = cls._lint_variant(
+                root_variant,
+                parsed=parsed,
                 rule_pack=rule_pack,
                 fix=fix,
-                fname=parsed.fname,
-                templated_file=variant.templated_file,
                 formatter=formatter,
             )
 
             # Set legacy variables for now
             # TODO: Revise this
-            templated_file = variant.templated_file
+            templated_file = root_variant.templated_file
             tree = fixed_tree
 
             # We're only going to return the *initial* errors, rather
@@ -727,7 +760,7 @@ class Linter:
             # Attempt to lint other variants if they exist.
             # TODO: Revise whether this is sensible...
             for idx, alternate_variant in enumerate(parsed.parsed_variants):
-                if alternate_variant is variant or not alternate_variant.tree:
+                if alternate_variant is root_variant or not alternate_variant.tree:
                     continue
                 linter_logger.info("lint_parsed - linting alt variant (%s)", idx)
                 (
@@ -735,13 +768,11 @@ class Linter:
                     alt_linting_errors,
                     _,  # Ignore Mask
                     _,  # Timings
-                ) = cls.lint_fix_parsed(
-                    alternate_variant.tree,
-                    config=parsed.config,
+                ) = cls._lint_variant(
+                    alternate_variant,
+                    parsed=parsed,
                     rule_pack=rule_pack,
                     fix=fix,
-                    fname=parsed.fname,
-                    templated_file=alternate_variant.templated_file,
                     formatter=formatter,
                 )
                 violations += alt_linting_errors
@@ -821,7 +852,9 @@ class Linter:
         # disable_noqa_except is not set, return the entire map.
         if not disable_noqa_except:
             return reference_map
-        output_map = reference_map
+        # Refactoring type: Introduce Defensive Copy. Copy map/sets before
+        # special-rule mutation so we don't mutate caller-owned data.
+        output_map = {key: set(values) for key, values in reference_map.items()}
         # Add the special rules so they can be excluded for `disable_noqa_except` usage
         for special_rule in ["PRS", "LXR", "TMP"]:
             output_map[special_rule] = {special_rule}
@@ -1079,27 +1112,19 @@ class Linter:
             (path,), fix, ignore_non_existent_files, ignore_files, processes
         ).paths[0]
 
-    def lint_paths(
+    def _expand_lint_paths(
         self,
         paths: tuple[str, ...],
-        fix: bool = False,
-        ignore_non_existent_files: bool = False,
-        ignore_files: bool = True,
-        processes: Optional[int] = None,
-        apply_fixes: bool = False,
-        fixed_file_suffix: str = "",
-        fix_even_unparsable: bool = False,
-        retain_files: bool = True,
-    ) -> LintingResult:
-        """Lint an iterable of paths."""
-        # If no paths specified - assume local
-        if not paths:  # pragma: no cover
-            paths = (os.getcwd(),)
-        # Set up the result to hold what we get back
+        ignore_non_existent_files: bool,
+        ignore_files: bool,
+        retain_files: bool,
+    ) -> tuple[LintingResult, list[str], dict[str, LintedDir]]:
+        """Expand input paths and map each file to a LintedDir."""
+        # Refactoring type: Extract Method. Path expansion setup moved out of
+        # lint_paths() to separate discovery from execution.
         result = LintingResult()
-
         expanded_paths: list[str] = []
-        expanded_path_to_linted_dir = {}
+        expanded_path_to_linted_dir: dict[str, LintedDir] = {}
         sql_exts = self.config.get("sql_file_exts", default=".sql").lower().split(",")
 
         for path in paths:
@@ -1114,38 +1139,21 @@ class Linter:
                 expanded_paths.append(fname)
                 expanded_path_to_linted_dir[fname] = linted_dir
 
-        files_count = len(expanded_paths)
-        if processes is None:
-            processes = self.config.get("processes", default=1)
-        assert processes is not None
-        # Hard set processes to 1 if only 1 file is queued.
-        # The overhead will never be worth it with one file.
-        if files_count == 1:
-            processes = 1
+        return result, expanded_paths, expanded_path_to_linted_dir
 
-        # to avoid circular import
-        from sqlfluff.core.linter.runner import get_runner
-
-        runner, effective_processes = get_runner(
-            self,
-            self.config,
-            processes=processes,
-            allow_process_parallelism=self.allow_process_parallelism,
-        )
-
-        if self.formatter and effective_processes != 1:
-            self.formatter.dispatch_processing_header(effective_processes)
-
-        # Show files progress bar only when there is more than one.
-        first_path = expanded_paths[0] if expanded_paths else ""
-        progress_bar_files = tqdm(
-            total=files_count,
-            desc=f"file {first_path}",
-            leave=False,
-            disable=files_count <= 1 or progress_bar_configuration.disable_progress_bar,
-        )
-
-        runner_iterator = runner.run(expanded_paths, fix)
+    def _process_lint_path_results(
+        self,
+        runner_iterator: Iterator[LintedFile],
+        expanded_paths: list[str],
+        expanded_path_to_linted_dir: dict[str, LintedDir],
+        progress_bar_files: tqdm,
+        apply_fixes: bool,
+        fix_even_unparsable: bool,
+        fixed_file_suffix: str,
+    ) -> None:
+        """Consume runner results and update linted directories/progress."""
+        # Refactoring type: Extract Method. Runner iteration and fix persistence
+        # moved out of lint_paths() to isolate processing from setup.
         try:
             for i, linted_file in enumerate(runner_iterator, start=1):
                 linted_dir = expanded_path_to_linted_dir[linted_file.path]
@@ -1180,6 +1188,71 @@ class Linter:
             runner_close = getattr(runner_iterator, "close", None)
             if runner_close:
                 runner_close()
+
+    def lint_paths(
+        self,
+        paths: tuple[str, ...],
+        fix: bool = False,
+        ignore_non_existent_files: bool = False,
+        ignore_files: bool = True,
+        processes: Optional[int] = None,
+        apply_fixes: bool = False,
+        fixed_file_suffix: str = "",
+        fix_even_unparsable: bool = False,
+        retain_files: bool = True,
+    ) -> LintingResult:
+        """Lint an iterable of paths."""
+        # If no paths specified - assume local
+        if not paths:  # pragma: no cover
+            paths = (os.getcwd(),)
+        result, expanded_paths, expanded_path_to_linted_dir = self._expand_lint_paths(
+            paths=paths,
+            ignore_non_existent_files=ignore_non_existent_files,
+            ignore_files=ignore_files,
+            retain_files=retain_files,
+        )
+
+        files_count = len(expanded_paths)
+        if processes is None:
+            processes = self.config.get("processes", default=1)
+        assert processes is not None
+        # Hard set processes to 1 if only 1 file is queued.
+        # The overhead will never be worth it with one file.
+        if files_count == 1:
+            processes = 1
+
+        # to avoid circular import
+        from sqlfluff.core.linter.runner import get_runner
+
+        runner, effective_processes = get_runner(
+            self,
+            self.config,
+            processes=processes,
+            allow_process_parallelism=self.allow_process_parallelism,
+        )
+
+        if self.formatter and effective_processes != 1:
+            self.formatter.dispatch_processing_header(effective_processes)
+
+        # Show files progress bar only when there is more than one.
+        first_path = expanded_paths[0] if expanded_paths else ""
+        progress_bar_files = tqdm(
+            total=files_count,
+            desc=f"file {first_path}",
+            leave=False,
+            disable=files_count <= 1 or progress_bar_configuration.disable_progress_bar,
+        )
+
+        runner_iterator = runner.run(expanded_paths, fix)
+        self._process_lint_path_results(
+            runner_iterator=runner_iterator,
+            expanded_paths=expanded_paths,
+            expanded_path_to_linted_dir=expanded_path_to_linted_dir,
+            progress_bar_files=progress_bar_files,
+            apply_fixes=apply_fixes,
+            fix_even_unparsable=fix_even_unparsable,
+            fixed_file_suffix=fixed_file_suffix,
+        )
 
         result.stop_timer()
         return result
